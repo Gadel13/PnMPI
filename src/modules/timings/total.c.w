@@ -1,12 +1,6 @@
-/* \brief Count MPI func calls time.
- *
- * \details This module counts how often each MPI call was invoked. Before MPI
- *  finalizes, statistics will be printed for each rank and a sum of the made
- *  calls by all ranks.
- */
-
 
 #include <stdio.h>
+
 #include <stddef.h>
 #include <sys/time.h>
 
@@ -14,11 +8,11 @@
 #include <pnmpi/debug_io.h>
 #include <pnmpi/hooks.h>
 #include <pnmpi/private/pmpi_assert.h>
+#include <pnmpi/private/tls.h>
+#include <pnmpi/service.h>
 #include <pnmpi/xmpi.h>
 
 #include "pnmpi-atomic.h"
-
-
 
 typedef unsigned long long timing_t;
 
@@ -26,6 +20,78 @@ timing_t get_time_ns() {
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	return tv.tv_sec * 1000000000ll + tv.tv_usec * 1000ll;
+}
+
+
+
+/* If there is no atomic support or no thread local storage support, we'll limit
+ * the threading level of this module to MPI_THREAD_SERIALIZED, so it is safe to
+ * use with threaded applications (but they may become slower!). */
+#if defined(METRIC_NO_ATOMIC) || defined(PNMPI_COMPILER_NO_TLS)
+const int PNMPI_SupportedThreadingLevel = MPI_THREAD_SERIALIZED;
+#endif
+
+
+/** \brief Struct of timing storage.
+ *
+ * \details This struct stores the time spent for each MPI calls.
+ */
+static struct timing_storage
+{
+  {{forallfn fn_name}}
+  metric_atomic_keyword timing_t {{fn_name}};
+  {{endforallfn}}
+} timing_storage = { 0 };
+
+
+/** \brief Global variable to store how often this module was invoked.
+ */
+metric_atomic_keyword size_t metric_invocations = 0;
+
+
+/** \brief Global variable to store how often this module was invoked with
+ *   Pcontrol enabled.
+ */
+metric_atomic_keyword size_t metric_invocations_pcontrol = 0;
+
+
+/** \brief Helper function to print \ref timing_storage struct.
+ *
+ * \details This function will print all functions called at least one
+ *  nanosecond.
+ *
+ *
+ * \param t \ref timing_storage struct to be printed.
+ */
+static void print_counters(struct timing_storage *t)
+{
+  {{forallfn fn_name}}
+  if (t->{{fn_name}} > 0)
+    printf("  %13.9fs %s\n", t->{{fn_name}} * 0.000000001, "{{fn_name}}");
+  {{endforallfn}}
+}
+
+
+/** \brief PnMPI module initialization hook.
+ *
+ * \details This function sets all counters to zero and initializes the module.
+ */
+void PNMPI_Init()
+{
+  /* The timing statics should be printed after all MPI_Finalize calls of the
+   * following PnMPI levels and stacks have been finished. As the timers may be
+   * invoked at different levels to track only some of the PnMPI levels, we have
+   * to count how often this module is in the PnMPI stack to know how many
+   * MPI_Finalize calls we have to ignore. */
+  metric_atomic_inc(metric_invocations);
+
+
+  /* Timing for MPI_Pcontrol is available for metric-timing invocations before
+   * and after the modules to test only. To satisfy this, we'll check for each
+   * invocation of this module, if it's Pcontrol-enabled. If it is, a counter
+   * will be increased. It will be checked when calling MPI_Pcontrol. */
+  if (PNMPI_Service_GetPcontrolSelf())
+    metric_atomic_inc(metric_invocations_pcontrol);
 }
 
 
@@ -51,66 +117,62 @@ static timing_t start_stop_timer(timing_t *t)
 }
 
 
-/* If there is no atomic support, we'll limit the threading level of this module
- * to MPI_THREAD_SERIALIZED, so it is safe to use with threaded applications
- * (but they may become slower!). */
-#if defined(METRIC_NO_ATOMIC)
-const int PNMPI_SupportedThreadingLevel = MPI_THREAD_SERIALIZED;
-#endif
-
-
-/** \brief Struct of counters.
- *
- * \details This struct stores the counters for all MPI calls.
- */
-static struct counter
-{
-  {{forallfn fn_name MPI_Finalize}}
-  metric_atomic_keyword size_t {{fn_name}};
-  {{endforallfn}}
-} counters = { 0 };
-
-
-/** \brief Helper function to print counter struct.
- *
- * \details This function will print all functions called at least once with
- *  their counter.
- *
- *
- * \param c \ref counter struct to be printed.
- */
-static void print_counters(struct counter *c)
-{
-  {{forallfn fn_name MPI_Finalize}}
-  if (c->{{fn_name}} > 0)
-    printf("  %8zu %s\n", c->{{fn_name}}, "{{fn_name}}");
-  {{endforallfn}}
-}
-
-
-/* Generate wrapper functions for all MPI calls to increment the counter on
- * every call. MPI_Finalize will be ignored, because it will be used to print
+/* Generate wrapper functions for all MPI calls to start and stop the counters
+ * on every call. MPI_Finalize will be ignored, because it will be used to print
  * the statistics below. */
 
 {{fnall fn_name MPI_Finalize MPI_Pcontrol}}
-    
-  metric_atomic_add(counters.{{fn_name}}, start_stop_timer(&timer));
-  WRAP_MPI_CALL_PREFIX
-  X{{fn_name}}({{args}});
-  WRAP_MPI_CALL_POSTFIX
-  metric_atomic_add(counters.{{fn_name}}, start_stop_timer(&timer));
+  /* The local timer will be defined as thread local storage, as each thread may
+   * call the function to be measured at the same time. With thread local
+   * storage, each thread has its own timer and does not get into conflict with
+   * other threads.
+   *
+   * This variable also will be used to indicate, if the timer is active. If the
+   * timer is 0, it is inactive, otherise it is active. */
+  static pnmpi_compiler_tls_keyword timing_t timer = 0;
 
+
+  metric_atomic_add(timing_storage.{{fn_name}}, start_stop_timer(&timer));
+  WRAP_MPI_CALL_PREFIX
+  int ret = X{{fn_name}}({{args}});
+  WRAP_MPI_CALL_POSTFIX
+  metric_atomic_add(timing_storage.{{fn_name}}, start_stop_timer(&timer));
+
+  return ret;
 {{endfnall}}
 
 
 /* MPI_Pcontrol needs special handling, as it doesn't call a PMPI function and
  * PnMPI does not implement the required XMPI call. Instead PnMPI will act as a
  * multiplexer for MPI_Pcontrol, so all we have to do is increment the counter
- * and return. */
+ * and return.
+ *
+ * The second problem is, we can't measure the timings in simple mode, as we
+ * need a start- and end-point to measure the time, but PnMPI gives us (per
+ * default) only the start-point. To overcome this metric_invocations_pcontrol
+ * must be devideable by two, so the first call is our start- and the second the
+ * end-time.
+ *
+ * Note: This option requires both modules set pcontrol to 'on'! */
 
 int MPI_Pcontrol(const int level, ...)
 {
-  metric_atomic_inc(counters.MPI_Pcontrol);
+  /* At this point it is save to get metric_invocations without any atomic
+   * safety, as writes only occur in PnMPI_Registration_Point. */
+  if ((metric_invocations_pcontrol % 2) != 0)
+    PNMPI_Error("metric-timing can measure the time of MPI_Pcontrol in "
+                "advanced mode, only.\n");
+
+
+  /* The local timer will be defined as thread local storage, as each thread may
+   * call the function to be measured at the same time. With thread local
+   * storage, each thread has its own timer and does not get into conflict with
+   * other threads.
+   *
+   * This variable also will be used to indicate, if the timer is active. If the
+   * timer is 0, it is inactive, otherise it is active. */
+  static pnmpi_compiler_tls_keyword timing_t timer = 0;
+  metric_atomic_add(timing_storage.MPI_Pcontrol, start_stop_timer(&timer));
 
   return MPI_SUCCESS;
 }
@@ -121,14 +183,36 @@ int MPI_Pcontrol(const int level, ...)
  * \details This function will print the statistics to stdout for each rank and
  *  a sum of all ranks.
  *
- * \todo In feature releases this should be done by the PNMPI_AppShutdown hook
- *  to track duplicated MPI_Finalize calls.
- *
  *
  * \return The return value of PMPI_Finalize will be pass through.
  */
 int MPI_Finalize()
 {
+  /* The local timer will be defined as thread local storage, as each thread may
+   * call the function to be measured at the same time. With thread local
+   * storage, each thread has its own timer and does not get into conflict with
+   * other threads.
+   *
+   * This variable also will be used to indicate, if the timer is active. If the
+   * timer is 0, it is inactive, otherwise it is active. */
+  static pnmpi_compiler_tls_keyword timing_t timer = 0;
+
+  // metric_atomic_add(timing_storage.MPI_Finalize, start_stop_timer(&timer));
+  // int ret = XMPI_Finalize();
+  // metric_atomic_add(timing_storage.MPI_Finalize, start_stop_timer(&timer));
+
+
+  /* Only the first module in the PnMPI stack should print the timing statistics
+   * AFTER all the other stacks have finished. As this module may have been
+   * invoked more than once in the stack, we've counted how often it was invoked
+   * in the registration point. We'll decrease this counter for each invocation
+   * of MPI_Finalize. If the counter is zero, we know that this is the first
+   * call to this module in the PnMPI stack. */
+  size_t level = metric_atomic_dec(metric_invocations);
+  if (level != 0)
+    return ret;
+
+
   /* Flush the buffers to avoid fragments in the output.
    *
    * NOTE: This can't fully prevent buffered output being displayed between
@@ -149,28 +233,28 @@ int MPI_Finalize()
   if (rank == 0)
     {
       printf("\n\n################################\n\n"
-             "MPI call stats:\n\n"
+             "Timing stats:\n\n"
              " Rank 0:\n");
-      print_counters(&counters);
+      print_counters(&timing_storage);
     }
 
   /* Rank 0 should receive the counters from other ranks now, to display those.
    * These will be summed up for the total counters printed below, to cache the
    * counters instead of using a reduction for receiving the counters of all
    * ranks a second time. */
-  struct counter tmp = { 0 };
+  struct timing_storage tmp = { 0 };
   int n;
   for (n = 1; n < size; n++)
     {
       {{forallfn fn_name MPI_Finalize}}
         if (rank > 0)
-          PMPI_Send(&(counters.{{fn_name}}), 1, MPI_UNSIGNED_LONG, 0, 0,
+          PMPI_Send(&(timing_storage.{{fn_name}}), 1, MPI_UNSIGNED_LONG_LONG, 0, 0,
                     MPI_COMM_WORLD);
         else
           {
-            PMPI_Recv(&(tmp.{{fn_name}}), 1, MPI_UNSIGNED_LONG, n, 0,
+            PMPI_Recv(&(tmp.{{fn_name}}), 1, MPI_UNSIGNED_LONG_LONG, n, 0,
                       MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            counters.{{fn_name}} += tmp.{{fn_name}};
+            timing_storage.{{fn_name}} += tmp.{{fn_name}};
           }
       {{endforallfn}}
 
@@ -181,15 +265,15 @@ int MPI_Finalize()
         }
     }
 
-  /* Print the total counters. These have been summed up in the counter struct
+  /* Print the total timing_storage. These have been summed up in the counter struct
    * of rank 0, so these have not to be received a second time. */
   if (rank == 0) {
     printf("\n Total:\n");
-    print_counters(&counters);
+    print_counters(&timing_storage);
     fflush(stdout);
   }
 
+  int ret = XMPI_Finalize();
 
-  /* Call original MPI_Finalize. */
-  return XMPI_Finalize();
+  return ret;
 }
