@@ -1,0 +1,10 @@
+#ifndef TIMINGS_CONFIG_H
+#define TIMINGS_CONFIG_H
+
+
+#cmakedefine C11_ATOMICS_FOUND
+#cmakedefine BUILTINATOMIC_FOUND
+#cmakedefine BUILTINSYNC_FOUND
+
+
+#endif
