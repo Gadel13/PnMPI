@@ -71,6 +71,17 @@ static void print_counters(struct timing_storage *t)
   {{endforallfn}}
 }
 
+static timing_t get_sum_of_counters(struct timing_storage *t)
+{
+  timing_t sum = 0;
+  {{forallfn fn_name}}
+  if (t->{{fn_name}} > 0)
+    sum += t->{{fn_name}};
+  {{endforallfn}}
+
+  return sum;
+}
+
 
 /** \brief PnMPI module initialization hook.
  *
@@ -209,8 +220,10 @@ int MPI_Finalize()
    * of MPI_Finalize. If the counter is zero, we know that this is the first
    * call to this module in the PnMPI stack. */
   size_t level = metric_atomic_dec(metric_invocations);
-  if (level != 0)
+  if (level != 0) {
+    int ret = XMPI_Finalize();
     return ret;
+  }
 
 
   /* Flush the buffers to avoid fragments in the output.
@@ -233,7 +246,7 @@ int MPI_Finalize()
   if (rank == 0)
     {
       printf("\n\n################################\n\n"
-             "Timing stats:\n\n"
+             "Total timing stats:\n\n"
              " Rank 0:\n");
       print_counters(&timing_storage);
     }
@@ -243,6 +256,7 @@ int MPI_Finalize()
    * counters instead of using a reduction for receiving the counters of all
    * ranks a second time. */
   struct timing_storage tmp = { 0 };
+  timing_t total = get_sum_of_counters(&timing_storage);
   int n;
   for (n = 1; n < size; n++)
     {
@@ -255,6 +269,7 @@ int MPI_Finalize()
             PMPI_Recv(&(tmp.{{fn_name}}), 1, MPI_UNSIGNED_LONG_LONG, n, 0,
                       MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             timing_storage.{{fn_name}} += tmp.{{fn_name}};
+	    total += tmp.{{fn_name}};
           }
       {{endforallfn}}
 
@@ -268,8 +283,11 @@ int MPI_Finalize()
   /* Print the total timing_storage. These have been summed up in the counter struct
    * of rank 0, so these have not to be received a second time. */
   if (rank == 0) {
-    printf("\n Total:\n");
+    printf("\n Total by func:\n");
     print_counters(&timing_storage);
+
+    printf("\n Total in MPI:\n");
+    printf("  %13.9fs \n", total * 0.000000001);
     fflush(stdout);
   }
 
