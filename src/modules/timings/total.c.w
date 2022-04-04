@@ -249,6 +249,8 @@ int MPI_Finalize()
              "Total timing stats:\n\n"
              " Rank 0:\n");
       print_counters(&timing_storage);
+      timing_t r0_total = get_sum_of_counters(&timing_storage);
+      printf("  %13.9fs %s\n", r0_total * 0.000000001, "Total sum");
     }
 
   /* Rank 0 should receive the counters from other ranks now, to display those.
@@ -260,6 +262,17 @@ int MPI_Finalize()
   int n;
   for (n = 1; n < size; n++)
     {
+      timing_t rn_total;
+      if (rank > 0) {
+          rn_total = get_sum_of_counters(&timing_storage);
+          PMPI_Send(&rn_total, 1, MPI_UNSIGNED_LONG_LONG, 0, 0,
+                    MPI_COMM_WORLD);
+      } else {
+         rn_total = 0;
+         PMPI_Recv(&rn_total, 1, MPI_UNSIGNED_LONG_LONG, n, 0,
+                   MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      }
+      
       {{forallfn fn_name MPI_Finalize}}
         if (rank > 0)
           PMPI_Send(&(timing_storage.{{fn_name}}), 1, MPI_UNSIGNED_LONG_LONG, 0, 0,
@@ -277,6 +290,7 @@ int MPI_Finalize()
         {
           printf("\n Rank %d:\n", n);
           print_counters(&tmp);
+          printf("  %13.9fs %s\n", rn_total * 0.000000001, "Total sum");
         }
     }
 
@@ -286,8 +300,7 @@ int MPI_Finalize()
     printf("\n Total by func:\n");
     print_counters(&timing_storage);
 
-    printf("\n Total in MPI:\n");
-    printf("  %13.9fs \n", total * 0.000000001);
+    printf("  %13.9fs %s\n", total * 0.000000001, "Total sum from all processes");
     fflush(stdout);
   }
 
